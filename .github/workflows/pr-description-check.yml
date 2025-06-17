@@ -1,0 +1,31 @@
+name: Check Pull Request Description
+
+on:
+  pull_request:
+    types: [opened, edited, reopened]
+
+jobs:
+  check-pr-description:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check if PR has a proper description
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            const description = pr.body || "";
+
+            const MIN_LENGTH = 20;
+            const issueRegex = /(fixes|closes|resolves)\s+#\d+/i;
+
+            if (description.length < MIN_LENGTH) {
+              core.setFailed(`❌ PR description is too short. Please write at least ${MIN_LENGTH} characters.`);
+            }
+
+            if (!issueRegex.test(description)) {
+              core.setFailed("❌ PR description must mention an issue. Use keywords like 'Fixes #123', 'Closes #456'.");
+            }
+
+            core.info("✅ PR description looks good!");
