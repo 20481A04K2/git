@@ -1,0 +1,107 @@
+version: 0.2
+
+env:
+  variables:
+    ECR_REGION: us-east-1                # US Virginia for ECR
+    ECS_REGION: ap-south-1               # Mumbai for ECS
+    AWS_ACCOUNT_ID: 209561933103
+    CLUSTER_NAME: vamsi-cluster
+    SERVICE_NAME: vamsi-service
+    TASK_DEFINITION_FAMILY: vamsi-task
+    CONTAINER_NAME: vamsi-container
+    SUBNET_ID: subnet-0063afb8321457f6b
+    SECURITY_GROUP_ID: sg-075d199e5a8d68257
+    EXECUTION_ROLE_ARN: arn:aws:iam::209561933103:role/ecsTaskExecutionRole
+
+
+phases:
+  install:
+    commands:
+      - echo Installing build dependencies...
+
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR Public in $ECR_REGION...
+      - aws --version
+      - aws ecr-public get-login-password --region $ECR_REGION | docker login --username AWS --password-stdin public.ecr.aws/i5n8n4i7
+      - REPOSITORY_URI=public.ecr.aws/i5n8n4i7/vamsi-repo
+      - IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - echo IMAGE_TAG=$IMAGE_TAG
+
+  build:
+    commands:
+      - echo Build started on `date`
+      - docker build -t $REPOSITORY_URI:$IMAGE_TAG .
+      - docker tag $REPOSITORY_URI:$IMAGE_TAG $REPOSITORY_URI:latest
+
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - echo Pushing Docker images to ECR in $ECR_REGION...
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - docker push $REPOSITORY_URI:latest
+      - echo Writing image definitions file...
+      - printf '[{"name":"%s","imageUri":"%s"}]' "$CONTAINER_NAME" "$REPOSITORY_URI:$IMAGE_TAG" > imagedefinitions.json
+      - cat imagedefinitions.json
+
+      - |
+        echo Registering ECS task definition in $ECS_REGION...
+        cat <<EOF > taskdef.json
+        {
+          "family": "$TASK_DEFINITION_FAMILY",
+          "networkMode": "awsvpc",
+          "executionRoleArn": "$EXECUTION_ROLE_ARN",
+          "requiresCompatibilities": ["FARGATE"],
+          "cpu": "256",
+          "memory": "512",
+          "containerDefinitions": [
+            {
+              "name": "$CONTAINER_NAME",
+              "image": "$REPOSITORY_URI:$IMAGE_TAG",
+              "portMappings": [
+                {
+                  "containerPort": 8080,
+                  "protocol": "tcp"
+                }
+              ],
+              "essential": true
+            }
+          ]
+        }
+        EOF
+
+      - |
+        TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://taskdef.json --region $ECS_REGION --query 'taskDefinition.taskDefinitionArn' --output text)
+        echo Task definition registered: $TASK_DEF_ARN
+
+      - |
+        echo Checking if ECS cluster exists in $ECS_REGION...
+        CLUSTER_STATUS=$(aws ecs describe-clusters --clusters $CLUSTER_NAME --region $ECS_REGION --query "clusters[0].status" --output text)
+        if [ "$CLUSTER_STATUS" != "ACTIVE" ]; then
+          echo "Cluster $CLUSTER_NAME does not exist. Creating cluster..."
+          aws ecs create-cluster --cluster-name $CLUSTER_NAME --region $ECS_REGION
+        else
+          echo "Cluster $CLUSTER_NAME already exists. Skipping creation."
+        fi
+
+      - |
+        echo Checking if ECS service exists in $ECS_REGION...
+        SERVICE_STATUS=$(aws ecs describe-services --cluster $CLUSTER_NAME --services $SERVICE_NAME --region $ECS_REGION --query "services[0].status" --output text)
+        if [ "$SERVICE_STATUS" = "ACTIVE" ]; then
+          echo "Service $SERVICE_NAME exists. Updating service with new task definition..."
+          aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --task-definition $TASK_DEF_ARN --region $ECS_REGION
+        else
+          echo "Service $SERVICE_NAME does not exist. Creating service..."
+          aws ecs create-service \
+            --cluster $CLUSTER_NAME \
+            --service-name $SERVICE_NAME \
+            --task-definition $TASK_DEF_ARN \
+            --desired-count 1 \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$SECURITY_GROUP_ID],assignPublicIp=ENABLED}" \
+            --region $ECS_REGION
+        fi
+
+artifacts:
+  files:
+    - imagedefinitions.json
